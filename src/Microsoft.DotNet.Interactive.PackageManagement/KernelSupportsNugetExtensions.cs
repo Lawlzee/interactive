@@ -2,20 +2,31 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Collections.Generic;
 using System.CommandLine;
+using System.CommandLine.Completions;
 using System.CommandLine.NamingConventionBinder;
+using System.CommandLine.Parsing;
 using System.CommandLine.Rendering;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.DotNet.Interactive.Events;
+using CompletionItem = System.CommandLine.Completions.CompletionItem;
+using System.Reactive.Linq;
+using NuGet.Configuration;
+using NuGet.Common;
+using NuGet.Protocol;
+using System.Threading;
+using NuGet.Protocol.Core.Types;
+using System.Text;
 
 namespace Microsoft.DotNet.Interactive
 {
     public static class KernelSupportsNugetExtensions
     {
-        public static T UseNugetDirective<T>(this T kernel) 
-            where T: Kernel, ISupportNuget
+        public static T UseNugetDirective<T>(this T kernel)
+            where T : Kernel, ISupportNuget
         {
             kernel.AddDirective(i());
             kernel.AddDirective(r());
@@ -51,39 +62,168 @@ namespace Microsoft.DotNet.Interactive
 
         private static Command r()
         {
+            var settings = Settings.LoadDefaultSettings(Directory.GetCurrentDirectory());
+            PackageSourceProvider provider = new PackageSourceProvider(settings);
+
+            List<PackageSource> listEndpoints = provider.LoadPackageSources()
+                .Where(p => p.IsEnabled)
+                .ToList();
+
+            SearchFilter searchFilter = new SearchFilter(includePrerelease: true);
+
+            var searchTasks = new List<Task<IEnumerable<IPackageSearchMetadata>>>();
+
+
+            List<PackageSearchResource> resources = new List<PackageSearchResource>();
+
+            foreach (PackageSource source in listEndpoints)
+            {
+                SourceRepository repository = Repository.Factory.GetCoreV3(source);
+                PackageSearchResource resource = repository.GetResourceAsync<PackageSearchResource>().Result;
+                resources.Add(resource);
+            }
+
+            var packageArgument = new Argument<PackageReferenceOrFileInfo>("package", Parse);
+            packageArgument.AddCompletions(GetCompletions);
+
             var rDirective = new Command("#r")
             {
-                new Argument<PackageReferenceOrFileInfo>(
-                    result =>
-                    {
-                        var token = result.Tokens
-                                          .Select(t => t.Value)
-                                          .SingleOrDefault();
-
-                        if (PackageReference.TryParse(token, out var reference))
-                        {
-                            return reference;
-                        }
-
-                        if (token is not null &&
-                            !token.StartsWith("nuget:") &&
-                            !EndsInDirectorySeparator(token))
-                        {
-                            return new FileInfo(token);
-                        }
-
-                        result.ErrorMessage = $"Unable to parse package reference: \"{token}\"";
-
-                        return null;
-                    })
-                {
-                    Name = "package"
-                }
+                packageArgument
             };
 
             rDirective.Handler = CommandHandler.Create<PackageReferenceOrFileInfo, KernelInvocationContext>(HandleAddPackageReference);
 
             return rDirective;
+
+            PackageReferenceOrFileInfo Parse(ArgumentResult result)
+            {
+                var token = result.Tokens
+                    .Select(t => t.Value)
+                    .SingleOrDefault();
+
+                if (PackageReference.TryParse(token, out var reference))
+                {
+                    return reference;
+                }
+
+                if (token is not null &&
+                    !token.StartsWith("nuget:") &&
+                    !EndsInDirectorySeparator(token))
+                {
+                    return new FileInfo(token);
+                }
+
+                result.ErrorMessage = $"Unable to parse package reference: \"{token}\"";
+
+                return null;
+
+            }
+
+
+            IEnumerable<CompletionItem> GetCompletions(CompletionContext context)
+            {
+                var token = context.ParseResult.Tokens[1].Value;
+
+                if (PackageReference.TryParse(token, out var reference))
+                {
+                    var completions = GetNuGetCompletionsAsync(reference).Result;
+                    return completions;
+                }
+
+                if ("nuget".StartsWith(token, StringComparison.OrdinalIgnoreCase))
+                {
+                    return new[]
+                    {
+                        new CompletionItem("nuget:")
+                    };
+                }
+
+                return Array.Empty<CompletionItem>();
+            }
+
+            async Task<IEnumerable<CompletionItem>> GetNuGetCompletionsAsync(PackageReference packageReference)
+            {
+                SearchFilter searchFilter = new SearchFilter(includePrerelease: true);
+
+                var searchTasks = new List<Task<IEnumerable<IPackageSearchMetadata>>>();
+
+                ILogger logger = new NullLogger();
+                CancellationToken cancellationToken = CancellationToken.None;
+
+                foreach (PackageSearchResource resource in resources)
+                {
+                    searchTasks.Add(resource.SearchAsync(
+                        packageReference.PackageName,
+                        searchFilter,
+                        skip: 0,
+                        take: 100,
+                        logger,
+                        cancellationToken));
+                }
+
+                var searchResult = (await Task.WhenAll(searchTasks))
+                    .SelectMany(x => x)
+                    .Where(x => x.Identity.Id.StartsWith(packageReference.PackageName, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                var completions = new List<CompletionItem>();
+
+                foreach (var package in searchResult)
+                {
+                    if (package.Identity.Id.Equals(packageReference.PackageName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        completions.Add(CreateCompletionItem(package, package.DownloadCount, version: "*-*"));
+
+                        var versions = (await package.GetVersionsAsync()).ToList();
+
+                        string orderFormat = $"D{Math.Ceiling(Math.Log10(versions.Count))}";
+
+                        var versionCompletions = versions
+                            .Select((x, i) => CreateCompletionItem(
+                                package,
+                                x.DownloadCount,
+                                x.Version.ToString(),
+                                order: (versions.Count - i).ToString(orderFormat)));
+
+                        completions.AddRange(versionCompletions);
+                    }
+                    else
+                    {
+                        completions.Add(CreateCompletionItem(package));
+                    }
+                }
+
+                return completions;
+            }
+
+            CompletionItem CreateCompletionItem(IPackageSearchMetadata package, long? downloadCount = null, string version = null, string order = null)
+            {
+                var label = version is null
+                    ? $"nuget:{package.Identity.Id}"
+                    : $"nuget:{package.Identity.Id},{version}";
+
+                string sortText = order is null
+                    ? $"nuget:{package.Identity.Id}"
+                    : $"nuget:{package.Identity.Id},{order}";
+
+                StringBuilder documentation = new StringBuilder();
+                documentation.AppendLine(package.Description);
+                documentation.AppendLine();
+
+                documentation.Append($"Version: ");
+                documentation.AppendLine(version);
+
+                documentation.Append($"Authors: ");
+                documentation.AppendLine(package.Authors);
+
+                documentation.Append($"Downloads: ");
+                documentation.AppendLine((downloadCount ?? package.DownloadCount)?.ToString());
+
+                documentation.Append($"Tags: ");
+                documentation.AppendLine(package.Tags);
+
+                return new CompletionItem(label, sortText: sortText, documentation: documentation.ToString());
+            }
 
             Task HandleAddPackageReference(
                 PackageReferenceOrFileInfo package,

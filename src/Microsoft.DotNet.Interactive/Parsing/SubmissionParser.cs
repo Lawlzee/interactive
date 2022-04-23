@@ -12,6 +12,7 @@ using System.Threading.Tasks;
 using Microsoft.CodeAnalysis.Text;
 using Microsoft.DotNet.Interactive.Commands;
 using Microsoft.DotNet.Interactive.Events;
+using CommandCompletionItem = System.CommandLine.Completions.CompletionItem;
 
 namespace Microsoft.DotNet.Interactive.Parsing
 {
@@ -344,12 +345,13 @@ namespace Microsoft.DotNet.Interactive.Parsing
             _directiveParser = null;
         }
 
-        public static CompletionItem CompletionItemFor(string name, ParseResult parseResult)
+        public static CompletionItem CompletionItemFor(CommandCompletionItem completionItem, ParseResult parseResult)
         {
-            var symbol = parseResult.CommandResult
-                                    .Command
-                                    .Children
-                                    .GetByAlias(name);
+            var symbol = parseResult
+                .CommandResult
+                .Command
+                .Children
+                .GetByAlias(completionItem.Label);
 
             var kind = symbol switch
             {
@@ -362,15 +364,14 @@ namespace Microsoft.DotNet.Interactive.Parsing
                 parseResult.Parser.Configuration.RootCommand.Name);
 
             return new CompletionItem(
-                displayText: name,
+                displayText: completionItem.Label,
                 kind: kind,
-                filterText: name,
-                sortText: name,
-                insertText: name,
-                documentation:
-                symbol is not null
+                filterText: completionItem.InsertText,
+                sortText: completionItem.SortText,
+                insertText: completionItem.InsertText,
+                documentation: symbol is not null
                     ? helpBuilder.GetHelpForSymbol(symbol)
-                    : null);
+                    : completionItem.Documentation);
         }
 
         private void EnsureRootCommandIsInitialized()

@@ -695,7 +695,7 @@ namespace Microsoft.DotNet.Interactive
             if (result.CommandResult.Command == ChooseKernelDirective)
             {
                 return result.GetCompletions()
-                             .Select(s => SubmissionParser.CompletionItemFor(s.Label, result));
+                             .Select(s => SubmissionParser.CompletionItemFor(s, result));
             }
 
             var allCompletions = new List<CompletionItem>();
@@ -712,7 +712,7 @@ namespace Microsoft.DotNet.Interactive
                 var suggestions = parseResult.GetCompletions(requestPosition);
 
                 var completions = suggestions
-                                  .Select(s => SubmissionParser.CompletionItemFor(s.Label, parseResult))
+                                  .Select(s => SubmissionParser.CompletionItemFor(s, parseResult))
                                   .ToArray();
 
                 allCompletions.AddRange(completions);
